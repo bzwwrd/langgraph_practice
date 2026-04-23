@@ -45,6 +45,19 @@ AI_QWEN_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/comple
 AI_QWEN_TIMEOUT_SEC = 30
 AI_USE_QWEN_WEB_SEARCH = True  # 不再调用 tushare 新闻接口，改由千问联网检索近期公开信息
 
+# =========================
+# 策略参数（可通过环境变量覆盖）
+# =========================
+# 放量阈值：默认调严格一些（4.0 倍），避免“很容易就符合”的信号泛滥
+MA60_VOL_LOOKBACK_DAYS = int(os.environ.get("MA60_VOL_LOOKBACK_DAYS", "5"))
+MA60_VOL_MULTIPLIER = float(os.environ.get("MA60_VOL_MULTIPLIER", "3.0"))
+
+# 成交量口径归一化：
+# - tushare pro.daily 的 vol 通常为“手”（1手=100股）
+# - ts.get_realtime_quotes 的 volume 可能出现与日线口径不一致（常见为“股”或展示口径差异）
+# 这里将内部统一按“手”存储，并提供 auto/显式配置。
+REALTIME_VOL_UNIT = os.environ.get("REALTIME_VOL_UNIT", "auto").strip().lower()  # auto|hands|shares
+
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -67,17 +80,21 @@ if not logger.handlers:
     logger.addHandler(_fh)
     logger.addHandler(_ch)
 
-# 设置 token（优先使用环境变量，避免硬编码）
+# 设置 token（优先环境变量；并避免在 import 时因写入 ~ 目录失败导致崩溃）
 _token_env = os.environ.get("TUSHARE_TOKEN")
+_tushare_token = _token_env or "qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea"
 if _token_env:
-    ts.set_token(_token_env)
-    logger.info("使用环境变量 TUSHARE_TOKEN 设置 tushare token")
+    logger.info("使用环境变量 TUSHARE_TOKEN 初始化 tushare pro_api")
 else:
-    # 保留原有硬编码 token 的兼容行为（建议迁移到环境变量）
-    ts.set_token('qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea')
+    # 兼容历史行为：仍允许脚本内 token；但更建议配置环境变量
     logger.warning("未设置环境变量 TUSHARE_TOKEN，当前使用脚本内 token（建议改为环境变量）")
-# 使用tushare API获取增量数据
-pro = ts.pro_api()
+
+# 使用 tushare API（传 token 以避免 set_token 写文件权限问题）
+try:
+    pro = ts.pro_api(_tushare_token)
+except Exception as e:
+    logger.error("tushare_pro_api_init_failed err=%s", str(e))
+    pro = None
 
 @dataclass
 class DataFreshness:
@@ -309,7 +326,11 @@ def validate_ohlcv_df(df: pd.DataFrame, ts_code: str, min_rows: int = 1) -> pd.D
     return df
 
 
-def try_get_realtime_quote_row(ts_code: str, name: str) -> Optional[pd.DataFrame]:
+def try_get_realtime_quote_row(
+    ts_code: str,
+    name: str,
+    recent_daily_vol_avg_hands: Optional[float] = None,
+) -> Optional[pd.DataFrame]:
     """
     旧版 tushare 的实时行情兜底方案。
     说明：
@@ -334,6 +355,24 @@ def try_get_realtime_quote_row(ts_code: str, name: str) -> Optional[pd.DataFrame
         def _to_float(value: Any) -> float:
             return float(value) if str(value).strip() not in {"", "None", "nan"} else 0.0
 
+        vol_raw = _to_float(row.get("volume"))
+        vol_unit_used = REALTIME_VOL_UNIT
+        # 统一内部口径为“手”（与 pro.daily 对齐）。如遇单位不一致，可用环境变量显式指定。
+        if REALTIME_VOL_UNIT == "shares":
+            vol = vol_raw / 100.0
+        elif REALTIME_VOL_UNIT == "hands":
+            vol = vol_raw
+        else:
+            # auto：如果实时 volume 显著大于日线均量，推断为“股”，换算为“手”
+            vol = vol_raw
+            if recent_daily_vol_avg_hands and recent_daily_vol_avg_hands > 0:
+                # shares vs hands 通常约 100 倍；这里用较宽松阈值避免误判
+                if vol_raw > recent_daily_vol_avg_hands * 20:
+                    vol = vol_raw / 100.0
+                    vol_unit_used = "shares(auto)"
+                else:
+                    vol_unit_used = "hands(auto)"
+
         today_row = pd.DataFrame([{
             "ts_code": ts_code,
             "trade_date": trade_date.strftime("%Y-%m-%d"),
@@ -342,13 +381,21 @@ def try_get_realtime_quote_row(ts_code: str, name: str) -> Optional[pd.DataFrame
             "low": _to_float(row.get("low")),
             "close": _to_float(row.get("price")),
             "pre_close": _to_float(row.get("pre_close")),
-            "vol": _to_float(row.get("volume")),
+            "vol": vol,
             "amount": _to_float(row.get("amount")),
             "name": row.get("name", name),
             "realtime_time": trade_time_raw,
             "data_source": "tushare_realtime_quotes",
         }])
-        logger.info("realtime_quotes 兜底成功 ts_code=%s trade_date=%s time=%s", ts_code, today_row.iloc[0]["trade_date"], trade_time_raw)
+        logger.info(
+            "realtime_quotes 兜底成功 ts_code=%s trade_date=%s time=%s vol_raw=%.2f vol_unit=%s vol_hands=%.2f",
+            ts_code,
+            today_row.iloc[0]["trade_date"],
+            trade_time_raw,
+            vol_raw,
+            vol_unit_used,
+            float(today_row.iloc[0]["vol"]),
+        )
         return today_row
     except Exception as e:
         logger.warning("realtime_quotes 兜底失败 ts_code=%s err=%s", ts_code, str(e))
@@ -637,6 +684,10 @@ class StockSelectionStrategy:
     """
     股票选股策略基类
     """
+    # 便于输出与回测对齐：每个策略给一个稳定的标识与展示名
+    strategy_id: str = "BASE"
+    strategy_name: str = "BaseStrategy"
+
     def apply(self, df):
         """
         应用选股策略
@@ -644,6 +695,19 @@ class StockSelectionStrategy:
         :return: 是否符合策略
         """
         raise NotImplementedError("子类必须实现apply方法")
+
+    def required_columns(self) -> List[str]:
+        """
+        策略计算依赖的列（用于 pick_stocks dropna subset，避免被非核心列清空整表）。
+        """
+        return []
+
+    def match_info(self, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        """
+        返回命中信号的结构化信息，用于最终输出（策略名称/触发时间/说明等）。
+        默认不提供，pick_stocks 会做兜底。
+        """
+        return None
 
 class MACDGoldenCrossStrategy(StockSelectionStrategy):
     """
@@ -653,6 +717,9 @@ class MACDGoldenCrossStrategy(StockSelectionStrategy):
     2. DIF和DEA距离零轴的比例（相对于三天前）
     3. 排除三天内比例变化不大的假金叉
     """
+    strategy_id = "MACD_GOLDEN_CROSS"
+    strategy_name = "MACD金叉"
+
     def __init__(self, days=2, min_change_threshold=0.02):
         """
         :param days: 检查最近几天的数据
@@ -737,11 +804,28 @@ class MACDGoldenCrossStrategy(StockSelectionStrategy):
 
         return result
 
+    def required_columns(self) -> List[str]:
+        return ["dif", "dea", "macd"]
+
+    def match_info(self, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        if df is None or df.empty:
+            return None
+        latest = df.iloc[-1]
+        return {
+            "strategy_id": self.strategy_id,
+            "strategy_name": self.strategy_name,
+            "trigger_time": latest.get("trade_date", "N/A"),
+            "reason": "MACD趋势向上",
+        }
+
 
 class PriceAboveMaStrategy(StockSelectionStrategy):
     """
     收盘价在N日均线上方的策略
     """
+    strategy_id = "PRICE_ABOVE_MA"
+    strategy_name = "均线站上"
+
     def __init__(self, ma_window=60, n_days=50):
         self.ma_window = ma_window
         self.n_days = n_days
@@ -782,10 +866,126 @@ class PriceAboveMaStrategy(StockSelectionStrategy):
 
         return result
 
+    def required_columns(self) -> List[str]:
+        return [f"ma{self.ma_window}", "close"]
+
+    def match_info(self, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        if df is None or df.empty:
+            return None
+        latest = df.iloc[-1]
+        return {
+            "strategy_id": f"{self.strategy_id}_{self.ma_window}",
+            "strategy_name": f"{self.strategy_name}(MA{self.ma_window})",
+            "trigger_time": latest.get("trade_date", "N/A"),
+            "reason": f"收盘价在MA{self.ma_window}上方（连续{self.n_days}日）",
+        }
+
+
+class MA60CrossWithVolumeStrategy(StockSelectionStrategy):
+    """
+    MA60 上穿 + 放量策略：
+    - 价格上穿 MA60：昨日 close <= 昨日 MA60 且 今日 close > 今日 MA60
+    - 放量：今日 vol > (过去 N 日平均成交量) * multiplier
+      其中“过去 N 日”默认取“今日之前的 N 个交易日”，不包含今日。
+    两个条件必须同时满足才算有效信号。
+    """
+    strategy_id = "MA60_CROSS_VOL"
+    strategy_name = "MA60上穿+放量"
+
+    def __init__(self, ma_window: int = 60, vol_lookback_days: int = 5, vol_multiplier: float = 1.5):
+        self.ma_window = ma_window
+        self.vol_lookback_days = vol_lookback_days
+        self.vol_multiplier = vol_multiplier
+
+    def required_columns(self) -> List[str]:
+        return [f"ma{self.ma_window}", "close", "vol", "trade_date"]
+
+    def apply(self, df: pd.DataFrame) -> bool:
+        print("MA60上穿+放量策略开始")
+        if df is None or df.empty:
+            return False
+
+        ma_col = f"ma{self.ma_window}"
+        for col in ["close", "vol", "trade_date", ma_col]:
+            if col not in df.columns:
+                print(f"MA60上穿+放量策略错误: 缺少列 {col}")
+                return False
+
+        # 至少需要：昨日+今日（2行） + 过去 N 日的量（不含今日） => N+1 行
+        min_rows = max(2, self.vol_lookback_days + 1)
+        if len(df) < min_rows:
+            print(f"MA60上穿+放量策略数据不足: 需要 >= {min_rows} 天数据，但只有 {len(df)} 天")
+            return False
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # MA 列可能因为滚动窗口不足而是 NaN；此时无法判断上穿
+        if pd.isna(latest.get(ma_col)) or pd.isna(prev.get(ma_col)):
+            print(f"MA60上穿+放量策略数据不足: {ma_col} 存在空值，无法判断上穿")
+            return False
+
+        prev_close = float(prev["close"])
+        prev_ma = float(prev[ma_col])
+        latest_close = float(latest["close"])
+        latest_ma = float(latest[ma_col])
+        cross_up = (prev_close <= prev_ma) and (latest_close > latest_ma)
+
+        # 放量：取“今日之前”的 N 天平均量
+        vol_hist = pd.to_numeric(df["vol"].iloc[-(self.vol_lookback_days + 1):-1], errors="coerce")
+        vol_avg = float(vol_hist.mean()) if len(vol_hist) > 0 else 0.0
+        latest_vol = float(latest["vol"]) if pd.notna(latest["vol"]) else 0.0
+        volume_ok = vol_avg > 0 and latest_vol > vol_avg * self.vol_multiplier
+
+        print(f"\n=== MA60上穿+放量分析开始 ===")
+        print(f"触发日: {latest.get('trade_date', 'N/A')}")
+        print(f"上穿条件: {'是' if cross_up else '否'} (昨日close={prev_close:.2f}, 昨日MA{self.ma_window}={prev_ma:.2f}; 今日close={latest_close:.2f}, 今日MA{self.ma_window}={latest_ma:.2f})")
+        if vol_avg > 0:
+            ratio = latest_vol / vol_avg
+            print(f"放量条件: {'是' if volume_ok else '否'} (今日vol={latest_vol:.2f}, 过去{self.vol_lookback_days}日均量={vol_avg:.2f}, 倍数={ratio:.2f}, 阈值={self.vol_multiplier:.2f})")
+        else:
+            print(f"放量条件: 否 (过去{self.vol_lookback_days}日均量为0或不可用)")
+        result = cross_up and volume_ok
+        print(f"MA60上穿+放量策略最终结果: {'通过' if result else '未通过'}")
+        print(f"=== MA60上穿+放量分析结束 ===\n")
+        return result
+
+    def match_info(self, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        if df is None or df.empty:
+            return None
+        latest = df.iloc[-1]
+        ma_col = f"ma{self.ma_window}"
+        vol_hist = pd.to_numeric(df["vol"].iloc[-(self.vol_lookback_days + 1):-1], errors="coerce")
+        vol_avg = float(vol_hist.mean()) if len(vol_hist) > 0 else None
+        latest_vol = _to_jsonable(latest.get("vol"))
+        vol_ratio = None
+        try:
+            if vol_avg and vol_avg > 0 and latest_vol is not None:
+                vol_ratio = float(latest_vol) / float(vol_avg)
+        except Exception:
+            vol_ratio = None
+        return {
+            "strategy_id": self.strategy_id,
+            "strategy_name": self.strategy_name,
+            "trigger_time": latest.get("trade_date", "N/A"),
+            "reason": "MA60突破+放量",
+            "details": {
+                "close": _to_jsonable(latest.get("close")),
+                "ma": _to_jsonable(latest.get(ma_col)),
+                "vol": latest_vol,
+                "vol_avg_past_days": vol_avg,
+                "vol_ratio": vol_ratio,
+                "vol_multiplier": self.vol_multiplier,
+            },
+        }
+
 class KDJStrategy(StockSelectionStrategy):
     """
     KDJ指标筛选策略
     """
+    strategy_id = "KDJ"
+    strategy_name = "KDJ"
+
     def __init__(self, n_days=5):
         self.n_days = n_days
 
@@ -830,6 +1030,20 @@ class KDJStrategy(StockSelectionStrategy):
         print(f"=== KDJ指标分析结束 ===\n")
 
         return result
+
+    def required_columns(self) -> List[str]:
+        return ["k", "d", "j"]
+
+    def match_info(self, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+        if df is None or df.empty:
+            return None
+        latest = df.iloc[-1]
+        return {
+            "strategy_id": f"{self.strategy_id}_{self.n_days}",
+            "strategy_name": f"{self.strategy_name}(n={self.n_days})",
+            "trigger_time": latest.get("trade_date", "N/A"),
+            "reason": "K>=D 且 J在0-40",
+        }
 
 def get_stock_list():
     """
@@ -973,11 +1187,19 @@ def get_incremental_data(ts_code, name, start_date=None):
     """
     # 先尝试从本地CSV加载已有数据
     existing_df = load_stock_data_from_csv(ts_code, name)
+    recent_daily_vol_avg_hands: Optional[float] = None
 
     if existing_df is not None and not existing_df.empty:
         existing_df = _normalize_trade_date_to_yyyy_mm_dd(existing_df)
         # 确保数据按日期排序后再获取最大日期
         existing_df = existing_df.sort_values('trade_date').reset_index(drop=True)
+        # 计算近期日线均量（手），用于实时口径 auto 推断
+        try:
+            v = pd.to_numeric(existing_df.get("vol"), errors="coerce").tail(MA60_VOL_LOOKBACK_DAYS)
+            if v is not None and len(v) > 0:
+                recent_daily_vol_avg_hands = float(v.mean())
+        except Exception:
+            recent_daily_vol_avg_hands = None
         # 检查trade_date的类型，如果是字符串需要先转换为datetime
         last_date_raw = existing_df['trade_date'].max()
         print(f"已有数据最后日期: {last_date_raw}")
@@ -1055,7 +1277,11 @@ def get_incremental_data(ts_code, name, start_date=None):
                     INTRADAY_MODE,
                 )
                 if INTRADAY_MODE == "try_realtime_quotes":
-                    realtime_row = try_get_realtime_quote_row(ts_code, name)
+                    realtime_row = try_get_realtime_quote_row(
+                        ts_code,
+                        name,
+                        recent_daily_vol_avg_hands=recent_daily_vol_avg_hands,
+                    )
                     if realtime_row is not None and not realtime_row.empty:
                         incremental_df = pd.concat([incremental_df, realtime_row], ignore_index=True)
                         data_may_delay = True
@@ -1365,6 +1591,108 @@ def print_backtest_summary(batch_results):
             print(f"    平均最大收益: {result['max_avg_return']:.2%}")
             print(f"    总收益: {result['total_return']:.2%}")
 
+
+def compare_strategies_backtest(
+    ts_codes: List[str],
+    strategies: Optional[List[StockSelectionStrategy]] = None,
+    lookback_days: int = 80,
+    hold_days: int = 5,
+) -> Dict[str, Any]:
+    """
+    多股票样本上的策略对比回测（用于验证信号有效性，并与 KDJ 进行对比）。
+    - 依赖本地 CSV 数据（避免回测时引入大量 tushare 调用）。
+    - 每只股票分别回测多种策略，输出单票与整体汇总指标。
+    """
+    if strategies is None:
+        strategies = [
+            KDJStrategy(n_days=1),
+            MA60CrossWithVolumeStrategy(
+                ma_window=60,
+                vol_lookback_days=MA60_VOL_LOOKBACK_DAYS,
+                vol_multiplier=MA60_VOL_MULTIPLIER,
+            ),
+        ]
+
+    results: List[Dict[str, Any]] = []
+    aggregate: Dict[str, Dict[str, float]] = {}
+
+    for ts_code in ts_codes:
+        name = resolve_stock_name(ts_code, fallback_name=ts_code)
+        stock_data = load_stock_data_from_csv(ts_code, name)
+        if stock_data is None or stock_data.empty:
+            logger.warning("回测跳过：无法加载本地数据 ts_code=%s", ts_code)
+            continue
+
+        try:
+            stock_data = validate_ohlcv_df(stock_data, ts_code=ts_code, min_rows=max(lookback_days + hold_days + 2, 60))
+        except Exception as e:
+            logger.warning("回测跳过：数据验证失败 ts_code=%s err=%s", ts_code, str(e))
+            continue
+
+        stock_data = stock_data.sort_values("trade_date").reset_index(drop=True)
+
+        per_stock = {"ts_code": ts_code, "name": name, "strategy_results": {}}
+        for strategy in strategies:
+            s_name = getattr(strategy, "strategy_name", strategy.__class__.__name__)
+            s_id = getattr(strategy, "strategy_id", strategy.__class__.__name__)
+            key = f"{s_id}:{s_name}"
+            r = backtest_strategy_performance(stock_data, strategy, lookback_days=lookback_days, hold_days=hold_days)
+            per_stock["strategy_results"][key] = r
+
+            if key not in aggregate:
+                aggregate[key] = {
+                    "total_trades": 0.0,
+                    "wins": 0.0,
+                    "sum_avg_return": 0.0,
+                    "sum_total_return": 0.0,
+                    "stocks": 0.0,
+                }
+            aggregate[key]["total_trades"] += float(r.get("total_trades", 0))
+            aggregate[key]["wins"] += float(r.get("total_trades", 0)) * float(r.get("win_rate", 0.0))
+            aggregate[key]["sum_avg_return"] += float(r.get("avg_return", 0.0))
+            aggregate[key]["sum_total_return"] += float(r.get("total_return", 0.0))
+            aggregate[key]["stocks"] += 1.0
+
+        results.append(per_stock)
+
+    # 打印对比报告（便于直接人工核对）
+    print("\n" + "=" * 80)
+    print("策略对比回测报告")
+    print("=" * 80)
+    print(f"样本股票数: {len(results)}  lookback_days={lookback_days}  hold_days={hold_days}")
+
+    for item in results:
+        print(f"\n股票: {item['ts_code']} ({item['name']})")
+        for strat_key, r in item["strategy_results"].items():
+            print(f"  {strat_key} - 交易次数: {r['total_trades']}, 胜率: {r['win_rate']:.2%}, 平均收益: {r['avg_return']:.2%}")
+
+    print("\n" + "-" * 80)
+    print("汇总(按策略聚合)")
+    print("-" * 80)
+    summary_rows: List[Dict[str, Any]] = []
+    for strat_key, agg in aggregate.items():
+        total_trades = agg["total_trades"]
+        win_rate = (agg["wins"] / total_trades) if total_trades > 0 else 0.0
+        avg_return_across_stocks = (agg["sum_avg_return"] / agg["stocks"]) if agg["stocks"] > 0 else 0.0
+        summary_rows.append(
+            {
+                "strategy": strat_key,
+                "total_trades": int(total_trades),
+                "win_rate": win_rate,
+                "avg_return_across_stocks": avg_return_across_stocks,
+                "sum_total_return": agg["sum_total_return"],
+            }
+        )
+    summary_rows.sort(key=lambda x: (x["win_rate"], x["total_trades"]), reverse=True)
+    for row in summary_rows:
+        print(
+            f"{row['strategy']} | trades={row['total_trades']} | win_rate={row['win_rate']:.2%} | "
+            f"avg_return={row['avg_return_across_stocks']:.2%} | sum_total_return={row['sum_total_return']:.2%}"
+        )
+
+    return {"per_stock": results, "summary": summary_rows}
+
+
 def pick_stocks(save_to_csv=True, strategies=None):
     """
     主要的选股函数
@@ -1420,20 +1748,19 @@ def pick_stocks(save_to_csv=True, strategies=None):
             # 只按当前策略依赖的核心列筛掉 NaN，避免被非核心列（如 name/realtime_time/data_source）清空整张表
             required_cols_for_strategies = ["trade_date", "close"]
             for strategy in strategies:
-                if isinstance(strategy, PriceAboveMaStrategy):
-                    required_cols_for_strategies.append(f"ma{strategy.ma_window}")
-                elif isinstance(strategy, KDJStrategy):
-                    required_cols_for_strategies.extend(["k", "d", "j"])
-                elif isinstance(strategy, MACDGoldenCrossStrategy):
-                    required_cols_for_strategies.extend(["dif", "dea", "macd"])
+                try:
+                    required_cols_for_strategies.extend(strategy.required_columns())
+                except Exception:
+                    # 兼容极端情况：策略未实现 required_columns
+                    pass
 
-            required_cols_for_strategies = [
-                col for col in dict.fromkeys(required_cols_for_strategies) if col in df.columns
-            ]
+            required_cols_for_strategies = [col for col in dict.fromkeys(required_cols_for_strategies)]
+            required_cols_for_strategies = [col for col in required_cols_for_strategies if col in df.columns]
             df = df.dropna(subset=required_cols_for_strategies)
 
             # 应用所有选股策略
             all_strategies_passed = True
+            matched_strategies: List[Dict[str, Any]] = []
             for strategy in strategies:
                 if not strategy.apply(df):
                     all_strategies_passed = False
@@ -1441,6 +1768,20 @@ def pick_stocks(save_to_csv=True, strategies=None):
                     break
                 else:
                     print(f"  策略通过")
+                    info = None
+                    try:
+                        info = strategy.match_info(df)
+                    except Exception:
+                        info = None
+                    if not info:
+                        latest = df.iloc[-1] if df is not None and not df.empty else {}
+                        info = {
+                            "strategy_id": getattr(strategy, "strategy_id", strategy.__class__.__name__),
+                            "strategy_name": getattr(strategy, "strategy_name", strategy.__class__.__name__),
+                            "trigger_time": latest.get("trade_date", "N/A") if hasattr(latest, "get") else "N/A",
+                            "reason": getattr(strategy, "strategy_name", strategy.__class__.__name__),
+                        }
+                    matched_strategies.append(info)
 
             if all_strategies_passed:
                 print(f"  >>>> 选择股票: {ts_code} ({stock['name']})")
@@ -1449,6 +1790,7 @@ def pick_stocks(save_to_csv=True, strategies=None):
                 selected_stocks.append({
                     'ts_code': ts_code,
                     'name': stock['name'],
+                    'matched_strategies': matched_strategies,
                     'latest_data': latest_data,  # 保存最新数据
                     'data_fetch_time': getattr(df, "attrs", {}).get("fetch_time"),
                     'data_may_delay': bool(getattr(df, "attrs", {}).get("data_may_delay", False)),
@@ -1468,6 +1810,135 @@ def pick_stocks(save_to_csv=True, strategies=None):
 
     return selected_stocks
 
+
+def pick_stocks_union(
+    *,
+    strategy_groups: Optional[List[List[StockSelectionStrategy]]] = None,
+    only_ts_codes: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """
+    并集模式选股：
+    - 每个 strategy_group 内部是 AND（该组内全部策略通过才算命中）
+    - 不同 group 之间做 OR（任一组命中则入选）
+    - 入选股票会合并所有命中的策略信息，输出为 matched_strategies 列表
+
+    默认（无参数）串行跑两套策略并集：
+    1) MA60上穿+放量
+    2) 60日均线上 + KDJ
+    """
+    if strategy_groups is None:
+        strategy_groups = [
+            # [
+            #     MA60CrossWithVolumeStrategy(
+            #         ma_window=60,
+            #         vol_lookback_days=MA60_VOL_LOOKBACK_DAYS,
+            #         vol_multiplier=MA60_VOL_MULTIPLIER,
+            #     )
+            # ],
+            [PriceAboveMaStrategy(ma_window=60, n_days=20), KDJStrategy(n_days=1)],
+        ]
+
+    stocks = get_stock_list()
+    if only_ts_codes:
+        stocks = stocks[stocks["ts_code"].isin(only_ts_codes)]
+        logger.info("仅处理指定股票: %s", sorted(list(only_ts_codes)))
+    print(f"总共有 {len(stocks)} 只符合条件的股票待检查")
+
+    # 汇总所有 group 的依赖列，用于 dropna subset
+    required_cols_for_strategies = ["trade_date", "close"]
+    for group in strategy_groups:
+        for strategy in group:
+            try:
+                required_cols_for_strategies.extend(strategy.required_columns())
+            except Exception:
+                pass
+    required_cols_for_strategies = [col for col in dict.fromkeys(required_cols_for_strategies)]
+
+    selected_stocks: List[Dict[str, Any]] = []
+    for i, (_, stock) in enumerate(stocks.iterrows()):
+        ts_code = stock["ts_code"]
+        print(f"\n正在处理第 {i+1}/{len(stocks)} 只股票: {ts_code} ({stock['name']})")
+
+        try:
+            df = load_stock_data_from_csv(ts_code, stock["name"])
+            if df is None:
+                print("  跳过: 文件不存在")
+                continue
+            if len(df) < 60:
+                print(f"  跳过: 数据不足60天，实际天数: {len(df)}")
+                continue
+
+            try:
+                df = validate_ohlcv_df(df, ts_code=ts_code, min_rows=60)
+            except Exception as ve:
+                logger.warning("数据验证失败，跳过 ts_code=%s err=%s", ts_code, str(ve))
+                continue
+
+            cols_in_df = [c for c in required_cols_for_strategies if c in df.columns]
+            df = df.dropna(subset=cols_in_df)
+
+            matched_strategies: List[Dict[str, Any]] = []
+            for group in strategy_groups:
+                group_passed = True
+                group_infos: List[Dict[str, Any]] = []
+                for strategy in group:
+                    if not strategy.apply(df):
+                        group_passed = False
+                        break
+
+                    info = None
+                    try:
+                        info = strategy.match_info(df)
+                    except Exception:
+                        info = None
+                    if not info:
+                        latest = df.iloc[-1] if df is not None and not df.empty else {}
+                        info = {
+                            "strategy_id": getattr(strategy, "strategy_id", strategy.__class__.__name__),
+                            "strategy_name": getattr(strategy, "strategy_name", strategy.__class__.__name__),
+                            "trigger_time": latest.get("trade_date", "N/A") if hasattr(latest, "get") else "N/A",
+                            "reason": getattr(strategy, "strategy_name", strategy.__class__.__name__),
+                        }
+                    group_infos.append(info)
+
+                if group_passed:
+                    matched_strategies.extend(group_infos)
+
+            if not matched_strategies:
+                print(f"  未选择股票: {ts_code} ({stock['name']})")
+                continue
+
+            # 去重（同一策略可能出现在多个 group）
+            seen = set()
+            deduped: List[Dict[str, Any]] = []
+            for info in matched_strategies:
+                sid = info.get("strategy_id")
+                key = sid or json.dumps(info, ensure_ascii=False, sort_keys=True)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(info)
+
+            print(f"  >>>> 选择股票(并集): {ts_code} ({stock['name']})")
+            latest_data = df.iloc[-1]
+            selected_stocks.append(
+                {
+                    "ts_code": ts_code,
+                    "name": stock["name"],
+                    "matched_strategies": deduped,
+                    "latest_data": latest_data,
+                    "data_fetch_time": getattr(df, "attrs", {}).get("fetch_time"),
+                    "data_may_delay": bool(getattr(df, "attrs", {}).get("data_may_delay", False)),
+                    "delay_reason": getattr(df, "attrs", {}).get("delay_reason", ""),
+                }
+            )
+        except Exception as e:
+            tr_bc = traceback.format_exc()
+            print(f"处理股票 {ts_code} 时出错: {str(e)}, 回溯信息: {tr_bc}")
+            continue
+
+    return selected_stocks
+
 if __name__ == "__main__":
     # python filter_stock_by_index.py ai-score 000601.SZ
     if len(sys.argv) >= 3 and sys.argv[1] == "ai-score":
@@ -1475,9 +1946,123 @@ if __name__ == "__main__":
         single_name = sys.argv[3] if len(sys.argv) >= 4 else None
         single_result = score_single_stock_with_ai(single_ts_code, single_name)
         print_single_stock_ai_score(single_result)
+    # python filter_stock_by_index.py backtest-compare 000001.SZ 000651.SZ ...
+    elif len(sys.argv) >= 3 and sys.argv[1] == "backtest-compare":
+        codes = sys.argv[2:]
+        compare_strategies_backtest(
+            codes,
+            strategies=[
+                KDJStrategy(n_days=1),
+                MA60CrossWithVolumeStrategy(
+                    ma_window=60,
+                    vol_lookback_days=MA60_VOL_LOOKBACK_DAYS,
+                    vol_multiplier=MA60_VOL_MULTIPLIER,
+                ),
+            ],
+            lookback_days=80,
+            hold_days=5,
+        )
+    # python filter_stock_by_index.py pick-ma60-vol
+    elif len(sys.argv) >= 2 and sys.argv[1] == "pick-ma60-vol":
+        # update_all_stocks_incremental()
+        result = pick_stocks(
+            strategies=[
+                MA60CrossWithVolumeStrategy(
+                    ma_window=60,
+                    vol_lookback_days=MA60_VOL_LOOKBACK_DAYS,
+                    vol_multiplier=MA60_VOL_MULTIPLIER,
+                )
+            ]
+        )
+        result = enrich_selected_stocks_with_ai(result)
+        print(f"\n符合条件的股票数量: {len(result)}")
+        print(f"数据获取时间(脚本本地): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if result:
+            print("\n筛选结果（含数据时间与延迟标注）")
+            print("=" * 80)
+        for stock in result:
+            # 复用默认输出逻辑（与默认分支保持一致）
+            print(f"{stock['ts_code']}: {stock['name']}")
+            latest_data = stock['latest_data']
+            fetch_time = stock.get("data_fetch_time")
+            fetch_time_str = fetch_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(fetch_time, datetime) else "N/A"
+            may_delay = stock.get("data_may_delay", False)
+            delay_reason = stock.get("delay_reason", "")
+            if may_delay:
+                print(f"  数据延迟提示: 可能存在延迟（{delay_reason or '未知原因'}）")
+            print(f"  数据采集时间: {fetch_time_str}")
+            print(f"  交易日期: {latest_data.get('trade_date', 'N/A')}")
+            if stock.get("matched_strategies"):
+                matched = stock["matched_strategies"]
+                trigger_time = matched[-1].get("trigger_time", latest_data.get("trade_date", "N/A"))
+                strategy_names = [m.get("strategy_name", "") for m in matched if m.get("strategy_name")]
+                strategy_ids = [m.get("strategy_id", "") for m in matched if m.get("strategy_id")]
+                reasons = [m.get("reason", "") for m in matched if m.get("reason")]
+                print(f"  触发时间: {trigger_time}")
+                print(f"  策略标识: {', '.join(strategy_ids) if strategy_ids else 'N/A'}")
+                print(f"  策略名称: {', '.join(strategy_names) if strategy_names else 'N/A'}")
+                print(f"  策略说明: {'; '.join(reasons) if reasons else 'N/A'}")
+            if 'close' in latest_data: print(f"  最新收盘价: {float(latest_data['close']):.2f}")
+            if 'open' in latest_data: print(f"  最新开盘价: {float(latest_data['open']):.2f}")
+            if 'high' in latest_data: print(f"  最新最高价: {float(latest_data['high']):.2f}")
+            if 'low' in latest_data: print(f"  最新最低价: {float(latest_data['low']):.2f}")
+            if 'vol' in latest_data: print(f"  最新成交量: {latest_data['vol']}")
+            print(f"  60日均线: {float(latest_data['ma60']):.2f}" if 'ma60' in latest_data else "  60日均线: N/A")
+            if "ai_score" in stock:
+                if stock.get("ai_model"):
+                    print(f"  AI模型: {stock.get('ai_model')}")
+                print(f"  AI消息面评分: {stock.get('ai_score', 'N/A')} ({stock.get('ai_sentiment', 'N/A')})")
+                print(f"  AI评分摘要: {stock.get('ai_summary', 'N/A')}")
+            print("-" * 80)
+    # python filter_stock_by_index.py pick-one 000001.SZ
+    elif len(sys.argv) >= 3 and sys.argv[1] == "pick-one":
+        only_code = sys.argv[2]
+        result = pick_stocks_union(only_ts_codes={only_code})
+        result = enrich_selected_stocks_with_ai(result)
+        print(f"\n符合条件的股票数量: {len(result)}")
+        print(f"数据获取时间(脚本本地): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if result:
+            print("\n筛选结果（含数据时间与延迟标注）")
+            print("=" * 80)
+        for stock in result:
+            print(f"{stock['ts_code']}: {stock['name']}")
+            latest_data = stock['latest_data']
+            fetch_time = stock.get("data_fetch_time")
+            fetch_time_str = fetch_time.strftime("%Y-%m-%d %H:%M:%S") if isinstance(fetch_time, datetime) else "N/A"
+            may_delay = stock.get("data_may_delay", False)
+            delay_reason = stock.get("delay_reason", "")
+            if may_delay:
+                print(f"  数据延迟提示: 可能存在延迟（{delay_reason or '未知原因'}）")
+            print(f"  数据采集时间: {fetch_time_str}")
+            print(f"  交易日期: {latest_data.get('trade_date', 'N/A')}")
+            if stock.get("matched_strategies"):
+                matched = stock["matched_strategies"]
+                trigger_time = matched[-1].get("trigger_time", latest_data.get("trade_date", "N/A"))
+                strategy_names = [m.get("strategy_name", "") for m in matched if m.get("strategy_name")]
+                strategy_ids = [m.get("strategy_id", "") for m in matched if m.get("strategy_id")]
+                reasons = [m.get("reason", "") for m in matched if m.get("reason")]
+                print(f"  触发时间: {trigger_time}")
+                print(f"  策略标识: {', '.join(strategy_ids) if strategy_ids else 'N/A'}")
+                print(f"  策略名称: {', '.join(strategy_names) if strategy_names else 'N/A'}")
+                print(f"  策略说明: {'; '.join(reasons) if reasons else 'N/A'}")
+            if 'close' in latest_data: print(f"  最新收盘价: {float(latest_data['close']):.2f}")
+            if 'open' in latest_data: print(f"  最新开盘价: {float(latest_data['open']):.2f}")
+            if 'high' in latest_data: print(f"  最新最高价: {float(latest_data['high']):.2f}")
+            if 'low' in latest_data: print(f"  最新最低价: {float(latest_data['low']):.2f}")
+            if 'vol' in latest_data: print(f"  最新成交量: {latest_data['vol']}")
+            print(f"  60日均线: {float(latest_data['ma60']):.2f}" if 'ma60' in latest_data else "  60日均线: N/A")
+            if "ai_score" in stock:
+                if stock.get("ai_model"):
+                    print(f"  AI模型: {stock.get('ai_model')}")
+                print(f"  AI消息面评分: {stock.get('ai_score', 'N/A')} ({stock.get('ai_sentiment', 'N/A')})")
+                print(f"  AI评分摘要: {stock.get('ai_summary', 'N/A')}")
+            print("-" * 80)
     else:
         update_all_stocks_incremental()
-        result = pick_stocks()
+        # 无参数默认串行跑两套策略并集：
+        # 1) MA60上穿+放量
+        # 2) 60日均线上 + KDJ
+        result = pick_stocks_union()
         result = enrich_selected_stocks_with_ai(result)
         # batch_backtest_selected_stocks()
         print(f"\n符合条件的股票数量: {len(result)}")
@@ -1496,6 +2081,18 @@ if __name__ == "__main__":
                 print(f"  数据延迟提示: 可能存在延迟（{delay_reason or '未知原因'}）")
             print(f"  数据采集时间: {fetch_time_str}")
             print(f"  交易日期: {latest_data.get('trade_date', 'N/A')}")
+            if stock.get("matched_strategies"):
+                # 输出统一字段：策略名称/触发时间/策略标识/策略说明
+                # 触发时间以“最后一个命中策略”的 trigger_time 为准（通常等于 latest trade_date）
+                matched = stock["matched_strategies"]
+                trigger_time = matched[-1].get("trigger_time", latest_data.get("trade_date", "N/A"))
+                strategy_names = [m.get("strategy_name", "") for m in matched if m.get("strategy_name")]
+                strategy_ids = [m.get("strategy_id", "") for m in matched if m.get("strategy_id")]
+                reasons = [m.get("reason", "") for m in matched if m.get("reason")]
+                print(f"  触发时间: {trigger_time}")
+                print(f"  策略标识: {', '.join(strategy_ids) if strategy_ids else 'N/A'}")
+                print(f"  策略名称: {', '.join(strategy_names) if strategy_names else 'N/A'}")
+                print(f"  策略说明: {'; '.join(reasons) if reasons else 'N/A'}")
             # 打印各项数据（缺字段时做容错）
             if 'close' in latest_data: print(f"  最新收盘价: {float(latest_data['close']):.2f}")
             if 'open' in latest_data: print(f"  最新开盘价: {float(latest_data['open']):.2f}")
