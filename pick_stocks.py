@@ -1222,7 +1222,6 @@ def get_incremental_data(ts_code, name, start_date=None):
     end_date = datetime.now().strftime('%Y-%m-%d')
 
     # # 设置token
-    # ts.set_token('qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea')
     # # 使用tushare API获取增量数据
     # pro = ts.pro_api()
     try:
