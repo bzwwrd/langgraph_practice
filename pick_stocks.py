@@ -1049,7 +1049,6 @@ def get_stock_list():
     """
     获取A股股票列表，并过滤掉ST股票和非600、000开头的股票
     """
-    # ts.set_token('qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea')
     # pro = ts.pro_api()
 
     # 获取股票基本信息（走统一的限流/重试/日志）
