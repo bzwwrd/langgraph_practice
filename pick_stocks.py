@@ -82,7 +82,7 @@ if not logger.handlers:
 
 # 设置 token（优先环境变量；并避免在 import 时因写入 ~ 目录失败导致崩溃）
 _token_env = os.environ.get("TUSHARE_TOKEN")
-_tushare_token = _token_env or "qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea"
+_tushare_token = _token_env or ""
 if _token_env:
     logger.info("使用环境变量 TUSHARE_TOKEN 初始化 tushare pro_api")
 else:
