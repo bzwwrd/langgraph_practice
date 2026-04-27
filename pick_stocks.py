@@ -28,10 +28,14 @@ ALERT_CONSECUTIVE_FAILURES = 3  # 连续失败 >=3 触发告警日志
 TEST_MODE = False  # 测试模式：仅处理这些股票代码；置空可恢复全量
 TEST_ONLY_TS_CODES = {"000601.SZ"}  # 测试模式：仅处理这些股票代码；置空可恢复全量
 
+# 并发配置（CPU/IO 混合：默认 8；可用环境变量覆盖）
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
+
 # 盘中实时能力说明：
 # - Tushare Pro 提供分钟线等更高频数据接口，但很多接口为“采集入库后提供”，并非交易所级别的严格实时。
 # - pro.daily 为日线接口，盘中时段可能尚未产出当日数据或存在延迟。
-INTRADAY_MODE = "try_realtime_quotes"  # 可选: "daily_only" / "try_realtime_quotes"
+# - pro.rt_k（实时日线）如果账号权限支持，可一次性批量拉取多股票当日K线，极大减少 daily 调用次数。
+INTRADAY_MODE = "try_realtime_quotes"  # 可选: "daily_only" / "try_realtime_quotes" / "rt_k_bulk"
 AI_SCORE_ENABLED = True  # 是否对筛选结果做 AI 消息面打分
 AI_NEWS_LOOKBACK_DAYS = 30
 AI_MAX_NEWS_ITEMS = 5
@@ -45,12 +49,15 @@ AI_QWEN_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/comple
 AI_QWEN_TIMEOUT_SEC = 30
 AI_USE_QWEN_WEB_SEARCH = True  # 不再调用 tushare 新闻接口，改由千问联网检索近期公开信息
 
+# AI 并发：避免对外部大模型接口造成压力，默认较小并发；可用环境变量覆盖
+AI_MAX_WORKERS = int(os.environ.get("AI_MAX_WORKERS", "4"))
+
 # =========================
 # 策略参数（可通过环境变量覆盖）
 # =========================
 # 放量阈值：默认调严格一些（4.0 倍），避免“很容易就符合”的信号泛滥
 MA60_VOL_LOOKBACK_DAYS = int(os.environ.get("MA60_VOL_LOOKBACK_DAYS", "5"))
-MA60_VOL_MULTIPLIER = float(os.environ.get("MA60_VOL_MULTIPLIER", "3.0"))
+MA60_VOL_MULTIPLIER = float(os.environ.get("MA60_VOL_MULTIPLIER", "5.0"))
 
 # 成交量口径归一化：
 # - tushare pro.daily 的 vol 通常为“手”（1手=100股）
@@ -82,7 +89,7 @@ if not logger.handlers:
 
 # 设置 token（优先环境变量；并避免在 import 时因写入 ~ 目录失败导致崩溃）
 _token_env = os.environ.get("TUSHARE_TOKEN")
-_tushare_token = _token_env or ""
+_tushare_token = _token_env or "qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea"
 if _token_env:
     logger.info("使用环境变量 TUSHARE_TOKEN 初始化 tushare pro_api")
 else:
@@ -582,9 +589,17 @@ def enrich_selected_stocks_with_ai(selected_stocks: List[Dict[str, Any]]) -> Lis
     if not AI_SCORE_ENABLED or not selected_stocks:
         return selected_stocks
 
-    logger.info("开始执行 AI 消息面评分 count=%s models=%s", len(selected_stocks), AI_QWEN_MODELS)
-    enriched: List[Dict[str, Any]] = []
-    for stock in selected_stocks:
+    # 并发执行：每只股票独立抓上下文 + 调用 AI。结果按输入顺序输出，避免并发导致顺序随机。
+    worker_count = max(1, min(AI_MAX_WORKERS, len(selected_stocks)))
+    logger.info(
+        "开始执行 AI 消息面评分 count=%s models=%s max_workers=%s",
+        len(selected_stocks),
+        AI_QWEN_MODELS,
+        worker_count,
+    )
+
+    def _score_one(index_and_stock: Tuple[int, Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+        idx, stock = index_and_stock
         stock_copy = dict(stock)
         try:
             context = fetch_stock_research_context(stock["ts_code"], stock["name"])
@@ -597,14 +612,26 @@ def enrich_selected_stocks_with_ai(selected_stocks: List[Dict[str, Any]]) -> Lis
             stock_copy["ai_risks"] = ai_result.get("risks", [])
             stock_copy["ai_model"] = ai_result.get("model")
         except Exception as e:
-            logger.warning("ai_score_failed ts_code=%s err=%s", stock["ts_code"], str(e))
+            logger.warning("ai_score_failed ts_code=%s err=%s", stock.get("ts_code"), str(e))
             stock_copy["ai_score"] = None
             stock_copy["ai_sentiment"] = "评分失败"
             stock_copy["ai_summary"] = f"AI评分失败: {str(e)}"
             stock_copy["ai_drivers"] = []
             stock_copy["ai_risks"] = []
-        enriched.append(stock_copy)
-    return enriched
+        return idx, stock_copy
+
+    indexed = list(enumerate(selected_stocks))
+    results: List[Tuple[int, Dict[str, Any]]] = []
+    if worker_count == 1:
+        results = [_score_one(item) for item in indexed]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as ex:
+            futures = [ex.submit(_score_one, item) for item in indexed]
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+    results.sort(key=lambda x: x[0])
+    return [item for _, item in results]
 
 
 def resolve_stock_name(ts_code: str, fallback_name: Optional[str] = None) -> str:
@@ -925,11 +952,20 @@ class MA60CrossWithVolumeStrategy(StockSelectionStrategy):
             print(f"MA60上穿+放量策略数据不足: {ma_col} 存在空值，无法判断上穿")
             return False
 
+        print(f"\n=== MA60上穿+放量分析开始 ===")
+        print(f"触发日: {latest.get('trade_date', 'N/A')}")
+        # print(f"上穿条件: {'是' if cross_up else '否'} (昨日close={prev_close:.2f}, 昨日MA{self.ma_window}={prev_ma:.2f}; 今日close={latest_close:.2f}, 今日MA{self.ma_window}={latest_ma:.2f})")
+
+
         prev_close = float(prev["close"])
         prev_ma = float(prev[ma_col])
         latest_close = float(latest["close"])
         latest_ma = float(latest[ma_col])
         cross_up = (prev_close <= prev_ma) and (latest_close > latest_ma)
+        if not cross_up:
+            print(f"MA60上穿+放量策略最终结果: 未通过")
+            print(f"=== MA60上穿+放量分析结束 ===\n")
+            return False
 
         # 放量：取“今日之前”的 N 天平均量
         vol_hist = pd.to_numeric(df["vol"].iloc[-(self.vol_lookback_days + 1):-1], errors="coerce")
@@ -937,9 +973,6 @@ class MA60CrossWithVolumeStrategy(StockSelectionStrategy):
         latest_vol = float(latest["vol"]) if pd.notna(latest["vol"]) else 0.0
         volume_ok = vol_avg > 0 and latest_vol > vol_avg * self.vol_multiplier
 
-        print(f"\n=== MA60上穿+放量分析开始 ===")
-        print(f"触发日: {latest.get('trade_date', 'N/A')}")
-        print(f"上穿条件: {'是' if cross_up else '否'} (昨日close={prev_close:.2f}, 昨日MA{self.ma_window}={prev_ma:.2f}; 今日close={latest_close:.2f}, 今日MA{self.ma_window}={latest_ma:.2f})")
         if vol_avg > 0:
             ratio = latest_vol / vol_avg
             print(f"放量条件: {'是' if volume_ok else '否'} (今日vol={latest_vol:.2f}, 过去{self.vol_lookback_days}日均量={vol_avg:.2f}, 倍数={ratio:.2f}, 阈值={self.vol_multiplier:.2f})")
@@ -1021,6 +1054,7 @@ class KDJStrategy(StockSelectionStrategy):
 
             # K线在D线上方，且J值在合理范围
             condition = (k_val >= d_val) and (0 <= j_val <= 40)
+            # condition = j_val <= 40
             conditions_met.append(condition)
 
             print(f"  {idx+1:2d}. 日期: {row.get('trade_date', 'N/A')}, K: {k_val:.2f}, D: {d_val:.2f}, J: {j_val:.2f}, 条件满足: {condition}")
@@ -1049,6 +1083,7 @@ def get_stock_list():
     """
     获取A股股票列表，并过滤掉ST股票和非600、000开头的股票
     """
+    # ts.set_token('qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea')
     # pro = ts.pro_api()
 
     # 获取股票基本信息（走统一的限流/重试/日志）
@@ -1222,6 +1257,7 @@ def get_incremental_data(ts_code, name, start_date=None):
     end_date = datetime.now().strftime('%Y-%m-%d')
 
     # # 设置token
+    # ts.set_token('qqpo836795038082a6484a0d1e43c54d3efc3efc8cd47131fd2d00ea')
     # # 使用tushare API获取增量数据
     # pro = ts.pro_api()
     try:
@@ -1340,7 +1376,7 @@ def get_incremental_data(ts_code, name, start_date=None):
         print(f"获取增量数据时出错: {str(e)}, 回溯信息: {tr_bc}")
         return existing_df  # 返回现有数据
 
-def update_all_stocks_incremental(max_workers=5):
+def update_all_stocks_incremental(max_workers: int = MAX_WORKERS):
     """
     对所有股票进行增量数据更新（简化版，使用for循环）
     """
@@ -1350,25 +1386,90 @@ def update_all_stocks_incremental(max_workers=5):
     processed = 0
     updated = 0
 
-    for i, (index, stock) in enumerate(stocks.iterrows()):
-        ts_code = stock['ts_code']
-        name = stock['name']
+    # 盘中 rt_k 批量模式：一次性拉取当日K线，再逐只合并写入
+    current_time = datetime.now()
+    if INTRADAY_MODE == "rt_k_bulk" and current_time.hour < 15:
+        ts_codes = stocks["ts_code"].tolist()
+        try:
+            rt_df, freshness = fetch_rt_k_bulk(ts_codes)
+            # build ts_code -> latest row map
+            rt_map: Dict[str, pd.Series] = {}
+            if rt_df is not None and not rt_df.empty and "ts_code" in rt_df.columns:
+                for code, sub in rt_df.groupby("ts_code"):
+                    sub = sub.sort_values("trade_date") if "trade_date" in sub.columns else sub
+                    rt_map[str(code)] = sub.iloc[-1]
 
+            logger.info("rt_k_bulk fetched rows=%s ts_codes=%s", 0 if rt_df is None else len(rt_df), len(ts_codes))
+
+            def _worker_rt_k(stock_row: pd.Series) -> Tuple[str, bool, Optional[str]]:
+                ts_code = str(stock_row["ts_code"])
+                name = str(stock_row["name"])
+                try:
+                    existing_df = load_stock_data_from_csv(ts_code, name)
+                    if existing_df is None or existing_df.empty:
+                        # 没有历史数据：回退到原增量逻辑（会拉 daily）
+                        result_df = get_incremental_data(ts_code, name)
+                        return ts_code, bool(result_df is not None), None
+
+                    today_row = rt_map.get(ts_code)
+                    if today_row is None:
+                        return ts_code, False, "rt_k_missing"
+
+                    _merge_today_row_and_save(
+                        ts_code=ts_code,
+                        name=name,
+                        existing_df=existing_df,
+                        today_row=today_row,
+                        freshness=freshness,
+                        delay_reason="盘中使用 rt_k 批量获取当日K线并合并落盘",
+                    )
+                    return ts_code, True, None
+                except Exception:
+                    return ts_code, False, traceback.format_exc()
+
+            futures = []
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                for _, stock in stocks.iterrows():
+                    futures.append(ex.submit(_worker_rt_k, stock))
+
+                for fut in as_completed(futures):
+                    ts_code, success, err = fut.result()
+                    processed += 1
+                    if success:
+                        updated += 1
+                    status = "成功" if success else "无数据/失败"
+                    print(f"[{processed}/{len(stocks)}] 更新股票 {ts_code}: {status}")
+                    if err and err != "rt_k_missing":
+                        logger.warning("update_stock_failed ts_code=%s err=%s", ts_code, err)
+
+            print(f"\n增量更新完成! 总共处理 {processed} 只股票，成功更新 {updated} 只股票")
+            return
+        except Exception as e:
+            logger.warning("rt_k_bulk_failed fallback_to_daily err=%s", str(e))
+
+    def _worker_daily(stock_row: pd.Series) -> Tuple[str, bool, Optional[str]]:
+        ts_code = str(stock_row["ts_code"])
+        name = str(stock_row["name"])
         try:
             result_df = get_incremental_data(ts_code, name)
-            success = result_df is not None
+            return ts_code, bool(result_df is not None), None
+        except Exception:
+            return ts_code, False, traceback.format_exc()
 
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for _, stock in stocks.iterrows():
+            futures.append(ex.submit(_worker_daily, stock))
+
+        for fut in as_completed(futures):
+            ts_code, success, err = fut.result()
             processed += 1
             if success:
                 updated += 1
-
-            status = "成功" if success else "无新数据"
+            status = "成功" if success else "无新数据/失败"
             print(f"[{processed}/{len(stocks)}] 更新股票 {ts_code}: {status}")
-
-        except Exception as e:
-            tr_bc = traceback.format_exc()
-            print(f"更新股票 {ts_code} 时出错: {str(tr_bc)}")
-            processed += 1
+            if err:
+                logger.warning("update_stock_failed ts_code=%s err=%s", ts_code, err)
 
     print(f"\n增量更新完成! 总共处理 {processed} 只股票，成功更新 {updated} 只股票")
 
@@ -1385,6 +1486,72 @@ def save_stock_data_with_indicators_to_csv(df, ts_code, name):
     filename = file_dir_path+f"stock_data_{ts_code}_{datetime.now().strftime('%Y%m%d')}_with_indicators.csv"
     df_copy.to_csv(filename, index=False)
     print(f"股票 {ts_code} ({name}) 的数据（含技术指标）已保存到 {filename}")
+
+
+def _normalize_rt_k_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    归一化 rt_k 返回的字段：
+    - 统一 trade_date 格式为 YYYY-MM-DD
+    - 统一成交量字段为 vol
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    # 常见字段兼容：rt_k 可能返回 date 字段
+    if "trade_date" not in df.columns and "date" in df.columns:
+        df["trade_date"] = df["date"]
+    if "vol" not in df.columns and "volume" in df.columns:
+        df["vol"] = df["volume"]
+    df = _normalize_trade_date_to_yyyy_mm_dd(df)
+    return df
+
+
+def fetch_rt_k_bulk(ts_codes: List[str]) -> Tuple[pd.DataFrame, DataFreshness]:
+    """
+    批量获取实时日线（rt_k）。期望返回包含 ts_code + open/high/low/close/vol 的 DataFrame。
+    """
+    if not ts_codes:
+        return pd.DataFrame(), DataFreshness(fetch_time=datetime.now(), data_may_delay=True, delay_reason="empty ts_codes")
+    if pro is None or not hasattr(pro, "rt_k"):
+        raise RuntimeError("tushare pro.rt_k 不可用（可能缺少权限或 pro_api 初始化失败）")
+
+    joined = ",".join(ts_codes)
+    df, freshness = ts_client.call("rt_k", pro.rt_k, ts_code=joined)
+    df = _normalize_rt_k_df(df)
+    return df, freshness
+
+
+def _merge_today_row_and_save(
+    ts_code: str,
+    name: str,
+    existing_df: pd.DataFrame,
+    today_row: pd.Series,
+    freshness: DataFreshness,
+    delay_reason: str,
+) -> pd.DataFrame:
+    """
+    将 rt_k 当日行合并进历史数据并落盘（覆盖/追加当日）。
+    """
+    # 只取我们需要的核心字段，避免把多余列污染 schema
+    row_dict = {k: today_row.get(k) for k in ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"] if k in today_row.index}
+    row_df = pd.DataFrame([row_dict])
+
+    existing_df = _normalize_trade_date_to_yyyy_mm_dd(existing_df)
+    row_df = _normalize_trade_date_to_yyyy_mm_dd(row_df)
+
+    combined_df = pd.concat([existing_df, row_df], ignore_index=True)
+    combined_df = combined_df.drop_duplicates(subset=["trade_date"], keep="last")
+    combined_df = combined_df.sort_values("trade_date").reset_index(drop=True)
+
+    combined_df = calculate_kdj(combined_df)
+    combined_df = calculate_macd(combined_df)
+    combined_df = calculate_ma(combined_df, windows=[5, 10, 20, 30, 60])
+
+    combined_df.attrs["fetch_time"] = freshness.fetch_time
+    combined_df.attrs["data_may_delay"] = True
+    combined_df.attrs["delay_reason"] = delay_reason
+    save_stock_data_to_csv(combined_df, ts_code, name)
+    return combined_df
 
 class BacktestEngine:
     """
@@ -1813,6 +1980,7 @@ def pick_stocks_union(
     *,
     strategy_groups: Optional[List[List[StockSelectionStrategy]]] = None,
     only_ts_codes: Optional[set] = None,
+    max_workers: int = MAX_WORKERS,
 ) -> List[Dict[str, Any]]:
     """
     并集模式选股：
@@ -1826,13 +1994,13 @@ def pick_stocks_union(
     """
     if strategy_groups is None:
         strategy_groups = [
-            # [
-            #     MA60CrossWithVolumeStrategy(
-            #         ma_window=60,
-            #         vol_lookback_days=MA60_VOL_LOOKBACK_DAYS,
-            #         vol_multiplier=MA60_VOL_MULTIPLIER,
-            #     )
-            # ],
+            [
+                MA60CrossWithVolumeStrategy(
+                    ma_window=60,
+                    vol_lookback_days=MA60_VOL_LOOKBACK_DAYS,
+                    vol_multiplier=MA60_VOL_MULTIPLIER,
+                )
+            ],
             [PriceAboveMaStrategy(ma_window=60, n_days=20), KDJStrategy(n_days=1)],
         ]
 
@@ -1852,26 +2020,17 @@ def pick_stocks_union(
                 pass
     required_cols_for_strategies = [col for col in dict.fromkeys(required_cols_for_strategies)]
 
-    selected_stocks: List[Dict[str, Any]] = []
-    for i, (_, stock) in enumerate(stocks.iterrows()):
-        ts_code = stock["ts_code"]
-        print(f"\n正在处理第 {i+1}/{len(stocks)} 只股票: {ts_code} ({stock['name']})")
-
+    def _worker_pick(stock_row: pd.Series) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        ts_code = str(stock_row["ts_code"])
+        name = str(stock_row["name"])
         try:
-            df = load_stock_data_from_csv(ts_code, stock["name"])
-            if df is None:
-                print("  跳过: 文件不存在")
-                continue
+            df = load_stock_data_from_csv(ts_code, name)
+            if df is None or df.empty:
+                return ts_code, None, None
             if len(df) < 60:
-                print(f"  跳过: 数据不足60天，实际天数: {len(df)}")
-                continue
+                return ts_code, None, None
 
-            try:
-                df = validate_ohlcv_df(df, ts_code=ts_code, min_rows=60)
-            except Exception as ve:
-                logger.warning("数据验证失败，跳过 ts_code=%s err=%s", ts_code, str(ve))
-                continue
-
+            df = validate_ohlcv_df(df, ts_code=ts_code, min_rows=60)
             cols_in_df = [c for c in required_cols_for_strategies if c in df.columns]
             df = df.dropna(subset=cols_in_df)
 
@@ -1883,7 +2042,6 @@ def pick_stocks_union(
                     if not strategy.apply(df):
                         group_passed = False
                         break
-
                     info = None
                     try:
                         info = strategy.match_info(df)
@@ -1898,15 +2056,12 @@ def pick_stocks_union(
                             "reason": getattr(strategy, "strategy_name", strategy.__class__.__name__),
                         }
                     group_infos.append(info)
-
                 if group_passed:
                     matched_strategies.extend(group_infos)
 
             if not matched_strategies:
-                print(f"  未选择股票: {ts_code} ({stock['name']})")
-                continue
+                return ts_code, None, None
 
-            # 去重（同一策略可能出现在多个 group）
             seen = set()
             deduped: List[Dict[str, Any]] = []
             for info in matched_strategies:
@@ -1917,24 +2072,44 @@ def pick_stocks_union(
                 seen.add(key)
                 deduped.append(info)
 
-            print(f"  >>>> 选择股票(并集): {ts_code} ({stock['name']})")
             latest_data = df.iloc[-1]
-            selected_stocks.append(
+            return (
+                ts_code,
                 {
                     "ts_code": ts_code,
-                    "name": stock["name"],
+                    "name": name,
                     "matched_strategies": deduped,
                     "latest_data": latest_data,
                     "data_fetch_time": getattr(df, "attrs", {}).get("fetch_time"),
                     "data_may_delay": bool(getattr(df, "attrs", {}).get("data_may_delay", False)),
                     "delay_reason": getattr(df, "attrs", {}).get("delay_reason", ""),
-                }
+                },
+                None,
             )
-        except Exception as e:
-            tr_bc = traceback.format_exc()
-            print(f"处理股票 {ts_code} 时出错: {str(e)}, 回溯信息: {tr_bc}")
-            continue
+        except Exception:
+            return ts_code, None, traceback.format_exc()
 
+    selected_stocks: List[Dict[str, Any]] = []
+    processed = 0
+    matched = 0
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for _, stock in stocks.iterrows():
+            futures.append(ex.submit(_worker_pick, stock))
+
+        for fut in as_completed(futures):
+            ts_code, picked, err = fut.result()
+            processed += 1
+            if picked:
+                selected_stocks.append(picked)
+                matched += 1
+            if err:
+                logger.warning("pick_failed ts_code=%s err=%s", ts_code, err)
+            if processed % 50 == 0 or processed == len(stocks):
+                print(f"已处理 {processed}/{len(stocks)}，命中 {matched}")
+
+    # 输出稳定排序（按代码），避免并发导致返回顺序随机
+    selected_stocks.sort(key=lambda x: x.get("ts_code", ""))
     return selected_stocks
 
 if __name__ == "__main__":
@@ -2056,7 +2231,7 @@ if __name__ == "__main__":
                 print(f"  AI评分摘要: {stock.get('ai_summary', 'N/A')}")
             print("-" * 80)
     else:
-        update_all_stocks_incremental()
+        # update_all_stocks_incremental()
         # 无参数默认串行跑两套策略并集：
         # 1) MA60上穿+放量
         # 2) 60日均线上 + KDJ
